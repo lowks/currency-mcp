@@ -68,6 +68,14 @@ Or run from the crate without installing:
 
 Then try a prompt such as “Convert 250 USD to MYR” or use the `convert_money` / `fx_briefing` prompts from the MCP prompts list.
 
+## Security
+
+This server is meant to run locally over **stdio**. Do not expose it as an unauthenticated network service.
+
+Outbound HTTP is pinned to `https://api.frankfurter.dev`, uses rustls, refuses redirects, and caps response size. Tool and prompt arguments are validated (ISO codes, real calendar dates, amount and range bounds, quote-list length). User text interpolated into prompts is stripped of control characters and wrapped as data. Upstream errors are sanitized before they reach the model.
+
+Outbound calls are rate-limited (default 60/min, burst 20). Override with `CURRENCY_MCP_RPM` and `CURRENCY_MCP_BURST`.
+
 ## Inspector
 
 ```bash

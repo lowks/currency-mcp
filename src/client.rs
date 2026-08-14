@@ -1,48 +1,63 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use thiserror::Error;
 
+use crate::security::{
+    self, API_BASE, MAX_BODY_BYTES, RateLimiter, SecurityError, assert_allowed_url, parse_date,
+    sanitize_error_message, validate_amount, validate_date_range, validate_query, validate_rate,
+};
 use crate::types::{ApiErrorBody, Conversion, Currency, RateQuote};
-
-const API_BASE: &str = "https://api.frankfurter.dev/v2";
 
 #[derive(Debug, Error)]
 pub enum ClientError {
-    #[error("invalid currency code '{0}'; use an ISO 4217 code such as USD or EUR")]
-    InvalidCurrency(String),
-    #[error("invalid date '{0}'; use YYYY-MM-DD")]
-    InvalidDate(String),
-    #[error("{0}")]
-    InvalidParam(String),
-    #[error("Frankfurter API error ({status}): {message}")]
+    #[error(transparent)]
+    Security(#[from] SecurityError),
+    #[error("exchange-rate provider error ({status}): {message}")]
     Api { status: u16, message: String },
-    #[error("network error talking to Frankfurter: {0}")]
-    Network(#[from] reqwest::Error),
+    #[error("network error talking to the exchange-rate provider")]
+    Network,
+    #[error("upstream response was too large")]
+    ResponseTooLarge,
+    #[error("refused to call an unexpected upstream URL")]
+    UnsafeUrl,
 }
 
 #[derive(Clone)]
 pub struct FrankfurterClient {
     http: reqwest::Client,
+    limiter: Arc<RateLimiter>,
 }
 
 impl FrankfurterClient {
-    pub fn new() -> Result<Self, ClientError> {
+    pub fn new() -> Result<Self, reqwest::Error> {
+        Self::with_limiter(Arc::new(RateLimiter::from_env()))
+    }
+
+    pub fn with_limiter(limiter: Arc<RateLimiter>) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
                 env!("CARGO_PKG_VERSION")
             ))
-            .timeout(Duration::from_secs(20))
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()?;
-        Ok(Self { http })
+        Ok(Self { http, limiter })
     }
 
     pub async fn list_currencies(&self, query: Option<&str>) -> Result<Vec<Currency>, ClientError> {
+        let query = match query.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => Some(validate_query(value)?),
+            None => None,
+        };
         let mut currencies: Vec<Currency> =
             self.get_json(&format!("{API_BASE}/currencies")).await?;
-        if let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) {
+        if let Some(query) = query {
             let needle = query.to_ascii_uppercase();
             currencies.retain(|currency| {
                 currency.iso_code.to_ascii_uppercase().contains(&needle)
@@ -54,7 +69,7 @@ impl FrankfurterClient {
     }
 
     pub async fn get_currency(&self, code: &str) -> Result<Currency, ClientError> {
-        let code = normalize_code(code)?;
+        let code = security::normalize_code(code)?;
         self.get_json(&format!("{API_BASE}/currency/{code}")).await
     }
 
@@ -64,14 +79,16 @@ impl FrankfurterClient {
         quote: &str,
         date: Option<&str>,
     ) -> Result<RateQuote, ClientError> {
-        let base = normalize_code(base)?;
-        let quote = normalize_code(quote)?;
+        let base = security::normalize_code(base)?;
+        let quote = security::normalize_code(quote)?;
         let mut url = format!("{API_BASE}/rate/{base}/{quote}");
         if let Some(date) = date {
-            let date = validate_date(date)?;
-            url.push_str(&format!("?date={date}"));
+            let date = parse_date(date)?;
+            url.push_str(&format!("?date={}", date.to_ymd()));
         }
-        self.get_json(&url).await
+        let rate: RateQuote = self.get_json(&url).await?;
+        validate_rate(rate.rate)?;
+        Ok(rate)
     }
 
     pub async fn get_rates(
@@ -83,36 +100,53 @@ impl FrankfurterClient {
         to: Option<&str>,
         group: Option<&str>,
     ) -> Result<Vec<RateQuote>, ClientError> {
-        let base = normalize_code(base)?;
+        let base = security::normalize_code(base)?;
         let mut url = format!("{API_BASE}/rates?base={base}");
 
+        match (from, to) {
+            (None, None) => {}
+            (Some(from), Some(to)) => {
+                if quotes.is_none() {
+                    return Err(SecurityError::InvalidParam(
+                        "quotes are required for a date range so the response stays bounded",
+                    )
+                    .into());
+                }
+                let (from, to) = validate_date_range(from, to)?;
+                url.push_str(&format!("&from={}&to={}", from.to_ymd(), to.to_ymd()));
+            }
+            _ => {
+                return Err(SecurityError::InvalidParam(
+                    "from_date and to_date must be provided together",
+                )
+                .into());
+            }
+        }
+
         if let Some(quotes) = quotes {
-            let quotes = normalize_quotes(quotes)?;
+            let quotes = security::normalize_quotes(quotes)?;
             url.push_str(&format!("&quotes={quotes}"));
         }
         if let Some(date) = date {
-            let date = validate_date(date)?;
-            url.push_str(&format!("&date={date}"));
+            let date = parse_date(date)?;
+            url.push_str(&format!("&date={}", date.to_ymd()));
         }
-        if let Some(from) = from {
-            let from = validate_date(from)?;
-            url.push_str(&format!("&from={from}"));
-        }
-        if let Some(to) = to {
-            let to = validate_date(to)?;
-            url.push_str(&format!("&to={to}"));
-        }
-        if let Some(group) = group.map(str::trim).filter(|g| !g.is_empty()) {
+        if let Some(group) = group.map(str::trim).filter(|value| !value.is_empty()) {
+            if group.len() > 16 {
+                return Err(SecurityError::InvalidParam("group must be 'week' or 'month'").into());
+            }
             let group = group.to_ascii_lowercase();
             if group != "week" && group != "month" {
-                return Err(ClientError::InvalidParam(
-                    "group must be 'week' or 'month'".into(),
-                ));
+                return Err(SecurityError::InvalidParam("group must be 'week' or 'month'").into());
             }
             url.push_str(&format!("&group={group}"));
         }
 
-        self.get_json(&url).await
+        let rates: Vec<RateQuote> = self.get_json(&url).await?;
+        for rate in &rates {
+            validate_rate(rate.rate)?;
+        }
+        Ok(rates)
     }
 
     pub async fn convert(
@@ -122,82 +156,67 @@ impl FrankfurterClient {
         to: &str,
         date: Option<&str>,
     ) -> Result<Conversion, ClientError> {
-        if !amount.is_finite() || amount < 0.0 {
-            return Err(ClientError::InvalidParam(
-                "amount must be a finite number greater than or equal to 0".into(),
-            ));
-        }
+        let amount = validate_amount(amount)?;
         let quote = self.get_rate(from, to, date).await?;
-        Ok(Conversion::from_quote(amount, &quote))
+        let conversion = Conversion::from_quote(amount, &quote);
+        if !conversion.converted.is_finite() {
+            return Err(SecurityError::InvalidParam("conversion overflowed").into());
+        }
+        Ok(conversion)
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
+        assert_allowed_url(url).map_err(|reason| {
+            tracing::error!(url, reason, "blocked unexpected upstream URL");
+            ClientError::UnsafeUrl
+        })?;
+        if let Err(retry_after_secs) = self.limiter.try_acquire() {
+            return Err(SecurityError::RateLimited { retry_after_secs }.into());
+        }
+
         tracing::debug!(url, "Frankfurter request");
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url).send().await.map_err(|error| {
+            tracing::warn!(%error, url, "upstream request failed");
+            ClientError::Network
+        })?;
+        if let Some(length) = response.content_length()
+            && length > MAX_BODY_BYTES as u64
+        {
+            return Err(ClientError::ResponseTooLarge);
+        }
+
         let status = response.status();
-        let body = response.text().await?;
+        let body = response.bytes().await.map_err(|error| {
+            tracing::warn!(%error, "failed to read upstream body");
+            ClientError::Network
+        })?;
+        if body.len() > MAX_BODY_BYTES {
+            return Err(ClientError::ResponseTooLarge);
+        }
+
         if !status.is_success() {
-            let message = serde_json::from_str::<ApiErrorBody>(&body)
+            let raw = String::from_utf8_lossy(&body);
+            let message = serde_json::from_str::<ApiErrorBody>(&raw)
                 .map(|error| error.message)
                 .unwrap_or_else(|_| {
-                    if body.is_empty() {
-                        status
-                            .canonical_reason()
-                            .unwrap_or("request failed")
-                            .to_string()
-                    } else {
-                        body
-                    }
+                    status
+                        .canonical_reason()
+                        .unwrap_or("request failed")
+                        .to_string()
                 });
             return Err(ClientError::Api {
                 status: status.as_u16(),
-                message,
+                message: sanitize_error_message(&message),
             });
         }
-        serde_json::from_str(&body).map_err(|error| ClientError::Api {
-            status: StatusCode::OK.as_u16(),
-            message: format!("unexpected response from Frankfurter: {error}"),
+
+        serde_json::from_slice(&body).map_err(|error| {
+            tracing::warn!(%error, "unexpected upstream JSON");
+            ClientError::Api {
+                status: StatusCode::OK.as_u16(),
+                message: "unexpected response from the exchange-rate provider".into(),
+            }
         })
-    }
-}
-
-fn normalize_code(code: &str) -> Result<String, ClientError> {
-    let code = code.trim().to_ascii_uppercase();
-    if code.len() != 3 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
-        return Err(ClientError::InvalidCurrency(code));
-    }
-    Ok(code)
-}
-
-fn normalize_quotes(quotes: &str) -> Result<String, ClientError> {
-    let mut codes = Vec::new();
-    for part in quotes.split(',') {
-        let code = normalize_code(part)?;
-        if !codes.contains(&code) {
-            codes.push(code);
-        }
-    }
-    if codes.is_empty() {
-        return Err(ClientError::InvalidParam(
-            "quotes must be a comma-separated list of ISO 4217 codes".into(),
-        ));
-    }
-    Ok(codes.join(","))
-}
-
-fn validate_date(date: &str) -> Result<&str, ClientError> {
-    let date = date.trim();
-    let valid = date.len() == 10
-        && date.as_bytes()[4] == b'-'
-        && date.as_bytes()[7] == b'-'
-        && date.bytes().enumerate().all(|(i, b)| match i {
-            4 | 7 => true,
-            _ => b.is_ascii_digit(),
-        });
-    if valid {
-        Ok(date)
-    } else {
-        Err(ClientError::InvalidDate(date.to_string()))
     }
 }
 
@@ -205,26 +224,17 @@ fn validate_date(date: &str) -> Result<&str, ClientError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn normalizes_currency_codes() {
-        assert_eq!(normalize_code(" usd ").unwrap(), "USD");
-        assert!(normalize_code("US").is_err());
-        assert!(normalize_code("USD1").is_err());
-        assert!(normalize_code("US$").is_err());
-    }
-
-    #[test]
-    fn normalizes_quote_lists() {
-        assert_eq!(normalize_quotes("eur, gbp,EUR").unwrap(), "EUR,GBP");
-        assert!(normalize_quotes("").is_err());
-        assert!(normalize_quotes("EURO").is_err());
-    }
-
-    #[test]
-    fn validates_iso_dates() {
-        assert_eq!(validate_date("2024-01-02").unwrap(), "2024-01-02");
-        assert!(validate_date("2024/01/02").is_err());
-        assert!(validate_date("yesterday").is_err());
+    #[tokio::test]
+    async fn convert_rejects_non_finite_amount() {
+        let client = FrankfurterClient::with_limiter(Arc::new(RateLimiter::new(60, 20))).unwrap();
+        let error = client
+            .convert(f64::NAN, "USD", "EUR", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Security(SecurityError::InvalidParam(_))
+        ));
     }
 
     #[tokio::test]
